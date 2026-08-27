@@ -1,0 +1,16 @@
+## .NET Core / C# ignores
+bin/
+obj/
+*.user
+*.userosscache
+*.sln.docstates
+
+## IDEs
+.idea/
+.vs/
+*.suo
+*.userprefs
+
+## OS
+.DS_Store
+Thumbs.db
