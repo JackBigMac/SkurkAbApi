@@ -4,16 +4,12 @@
 // Starta lokalt:  dotnet run
 // Swagger UI:     https://localhost:{port}/swagger
 //
-// v35 — Azure-konfiguration (görs i portalen, inte i koden):
+// Azure-konfiguration (görs i portalen, inte i koden):
 // 1. CORS: App Service → API → CORS → lägg till din frontend-URL
 // 2. Easy Auth: App Service → Authentication → Add identity provider → Microsoft
 //    Välj din Entra ID-tenant. Alla anrop kräver nu inloggning.
-// 3. App-roller i Entra ID: gå till App registrations → din app → App roles
-//    Skapa rollerna Praktikant, Mellanchef, Konsultchef, Admin.
-//    Tilldela dem till dina Entra ID-användare under Enterprise applications.
-//
-// När Easy Auth är på injicerar Azure en header (X-MS-CLIENT-PRINCIPAL) med
-// den inloggade användarens information — den här API:n läser rollen därifrån.
+// 3. Roller för denna skoluppgift hanteras i applikationen nedan, eftersom
+//    Easy Auth identifierar användaren men Entra-roller inte kan tilldelas av gruppen.
 
 using System.Text;
 using System.Text.Json;
@@ -50,8 +46,8 @@ app.UseCors("SkurkPolicy");
 // Datan nollställs vid omstart — en riktig app använder databas
 // -------------------------------------------------------
 
-var uppdrag   = new List<Uppdrag>  { new(1, "Operation Mörkblå", "Pågående", "KRITISK", "Ronny Rövare") };
-var konsulter = new List<Konsult>  { new(1, "Ronny Rövare", "070-666666", "Mörkret 1", "Stockholm") };
+var uppdrag = new List<Uppdrag> { new(1, "Operation Mörkblå", "Pågående", "KRITISK", "Ronny Rövare") };
+var konsulter = new List<Konsult> { new(1, "Ronny Rövare", "070-666666", "Mörkret 1", "Stockholm") };
 var nastaUppdragId = 2;
 var nastaKonsultId = 2;
 
@@ -83,7 +79,7 @@ app.MapPut("/uppdrag/{id}", (int id, UppdragUpdate update, HttpRequest req) =>
     if (index < 0) return Results.NotFound();
     uppdrag[index] = uppdrag[index] with
     {
-        Status    = update.Status    ?? uppdrag[index].Status,
+        Status = update.Status ?? uppdrag[index].Status,
         Prioritet = update.Prioritet ?? uppdrag[index].Prioritet
     };
     return Results.Ok(uppdrag[index]);
@@ -129,7 +125,7 @@ app.MapGet("/konsulter", (HttpRequest req) =>
     {
         "Praktikant" => k with { Adress = null, Stad = null },  // ser bara namn + telefon
         "Mellanchef" => k with { Telefon = null },              // ser namn + adress/stad
-        _            => k                                        // Konsultchef och Admin ser allt
+        _ => k                                        // Konsultchef och Admin ser allt
     });
 })
 .WithName("HamtaKonsulter")
@@ -154,10 +150,10 @@ app.MapPut("/konsulter/{id}", (int id, KonsultUpdate update, HttpRequest req) =>
     if (index < 0) return Results.NotFound();
     konsulter[index] = konsulter[index] with
     {
-        Namn    = update.Namn    ?? konsulter[index].Namn,
+        Namn = update.Namn ?? konsulter[index].Namn,
         Telefon = update.Telefon ?? konsulter[index].Telefon,
-        Adress  = update.Adress  ?? konsulter[index].Adress,
-        Stad    = update.Stad    ?? konsulter[index].Stad
+        Adress = update.Adress ?? konsulter[index].Adress,
+        Stad = update.Stad ?? konsulter[index].Stad
     };
     return Results.Ok(konsulter[index]);
 })
@@ -182,37 +178,63 @@ app.Run();
 // Rollkontroll
 // ======================================================
 
-// Läser rollen ur Easy Auth-headern som Azure injicerar efter inloggning.
-// Lokalt (utan Easy Auth): returnerar "Admin" så Swagger fungerar utan inloggning.
+// Easy Auth verifierar först Microsoft-inloggningen och skickar sedan användarens
+// claims i X-MS-CLIENT-PRINCIPAL. Vi läser e-post/UPN därifrån och mappar den till
+// en applikationsroll. Det kräver inga Entra App Roles eller Entra-administratör.
+// Lokalt, utan Easy Auth-header, används Admin så att Swagger fungerar som tidigare.
 string HamtaRoll(HttpRequest request)
 {
-    var header = request.Headers["X-MS-CLIENT-PRINCIPAL"].FirstOrDefault();
-    if (string.IsNullOrEmpty(header)) return "Admin"; // lokal dev
+    var principalHeader = request.Headers["X-MS-CLIENT-PRINCIPAL"].FirstOrDefault();
+    if (string.IsNullOrWhiteSpace(principalHeader)) return "Admin"; // lokal utveckling
 
+    var epost = HamtaEasyAuthEpost(principalHeader)
+                ?? request.Headers["X-MS-CLIENT-PRINCIPAL-NAME"].FirstOrDefault();
+
+    return epost?.Trim().ToLowerInvariant() switch
+    {
+        "jack.reveny@ithogskolan.onmicrosoft.com" => "Admin",
+        "christian.savic@ithogskolan.onmicrosoft.com" => "Mellanchef",
+        "hilal.ozkan@ithogskolan.onmicrosoft.com" => "Konsultchef",
+        _ => "Praktikant"
+    };
+}
+
+// Olika Microsoft-konfigurationer kan lämna e-postadressen i olika claim-typer.
+// Därför stödjer vi både standardiserade och Microsoft-specifika namn.
+string? HamtaEasyAuthEpost(string principalHeader)
+{
     try
     {
-        var json = Encoding.UTF8.GetString(Convert.FromBase64String(header));
+        var json = Encoding.UTF8.GetString(Convert.FromBase64String(principalHeader));
         using var doc = JsonDocument.Parse(json);
+
         foreach (var claim in doc.RootElement.GetProperty("claims").EnumerateArray())
         {
-            if (claim.GetProperty("typ").GetString() == "roles")
-                return claim.GetProperty("val").GetString() ?? "Praktikant";
+            var typ = claim.GetProperty("typ").GetString();
+            if (typ is "preferred_username" or "email" or "emails" or "upn" or
+                "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress" or
+                "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn")
+            {
+                return claim.GetProperty("val").GetString();
+            }
         }
     }
-    catch { }
+    catch (FormatException) { }
+    catch (JsonException) { }
+    catch (KeyNotFoundException) { }
 
-    return "Praktikant"; // okänd roll → minsta behörighet
+    return null;
 }
 
 // Kontrollerar om en roll har tillräcklig behörighet.
 // Hierarki: Praktikant < Mellanchef < Konsultchef < Admin
 bool HarBehorighet(string roll, string kravRoll) => (roll, kravRoll) switch
 {
-    (_, "Praktikant")                                      => true,
+    (_, "Praktikant") => true,
     ("Mellanchef" or "Konsultchef" or "Admin", "Mellanchef") => true,
-    ("Konsultchef" or "Admin", "Konsultchef")              => true,
-    ("Admin", "Admin")                                     => true,
-    _                                                      => false
+    ("Konsultchef" or "Admin", "Konsultchef") => true,
+    ("Admin", "Admin") => true,
+    _ => false
 };
 
 // ======================================================
